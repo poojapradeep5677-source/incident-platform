@@ -1,0 +1,6 @@
+*.csv
+*.pem
+*.key
+*.txt
+.git
+node_modules
