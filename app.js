@@ -224,6 +224,7 @@ app.get('/logout', function(req, res) {
     res.redirect('/login');
 });
 
+// ================= ROLE-BASED DASHBOARD =================
 app.get('/dashboard', requireLogin, async function(req, res) {
     var stats = { total: 0, phishing: 0, safe: 0 };
     try {
@@ -239,16 +240,34 @@ app.get('/dashboard', requireLogin, async function(req, res) {
     html += nav(req.session.user);
     html += '<div class="main">';
     html += '<h1>Welcome, ' + req.session.user.name + '</h1>';
-    html += '<p style="text-align:center;">Role: <span class="badge badge-blue">' + req.session.user.role + '</span></p>';
+    html += '<p style="text-align:center;">Logged in as: <span class="badge badge-blue">' + req.session.user.role + '</span></p>';
+
+    // DIFFERENT VIEWS BASED ON ROLE
+    if (req.session.user.role === 'Employee') {
+        html += '<div class="card"><h2>Employee Portal</h2>';
+        html += '<p>As an Employee, your role is to report suspicious messages to the security team.</p>';
+        html += '<a href="/" class="btn">Report New Incident</a></div>';
+        
+    } else if (req.session.user.role === 'Analyst') {
+        html += '<div class="card"><h2>Analyst Queue</h2>';
+        html += '<p>As an Analyst, your role is to investigate reported incidents, assign them to yourself, and update their status.</p>';
+        html += '<a href="/incidents" class="btn">Go to Investigation Queue</a></div>';
+
+    } else if (req.session.user.role === 'Admin') {
+        html += '<div class="card"><h2>Admin Command Center</h2>';
+        html += '<p>As an Admin, you have full visibility into the security posture and can manage all incidents.</p>';
+        html += '<a href="/incidents" class="btn">View All Incidents</a>';
+        html += '<a href="/admin" class="btn btn-secondary">Admin Settings</a></div>';
+    }
+
+    // Show the stats to everyone
     html += '<div class="stat-grid">';
     html += '<div class="stat"><div class="num">' + stats.total + '</div><div class="lbl">Total Incidents</div></div>';
     html += '<div class="stat"><div class="num" style="color:#ef4444;">' + stats.phishing + '</div><div class="lbl">Phishing Detected</div></div>';
     html += '<div class="stat"><div class="num" style="color:#22c55e;">' + stats.safe + '</div><div class="lbl">Safe</div></div>';
     html += '</div>';
-    html += '<div class="card"><h2>Quick Actions</h2>';
-    html += '<a href="/" class="btn">Report New Incident</a>';
-    html += '<a href="/incidents" class="btn btn-secondary">View All Incidents</a>';
-    html += '</div></div></body></html>';
+
+    html += '</div></body></html>';
     res.send(html);
 });
 
