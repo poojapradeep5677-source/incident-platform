@@ -39,6 +39,17 @@ const pool = new Pool({
     max: 10
 });
 
+// AUTOMATICALLY CREATE HISTORY TABLE ON STARTUP
+pool.query(`
+    CREATE TABLE IF NOT EXISTS incident_history (
+        id SERIAL PRIMARY KEY,
+        incident_id INT REFERENCES incidents(id),
+        action VARCHAR(255),
+        performed_by VARCHAR(255),
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+`).catch(err => console.error("History table creation error:", err));
+
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 
 function getSecretHash(email) {
@@ -90,12 +101,10 @@ app.get('/', requireLogin, function(req, res) {
     html += '<p style="text-align:center;">AI-Powered Phishing Detection</p>';
     html += '<div class="card"><h2>Report Suspicious Message</h2>';
     
-    // ADDED enctype="multipart/form-data" for file uploads
     html += '<form method="POST" action="/analyze" enctype="multipart/form-data">';
     html += '<label>Paste the suspicious message</label>';
     html += '<textarea name="message" rows="6" required>Urgent! Your bank account has been compromised. Click this link to reset your password immediately.</textarea>';
     
-    // ADDED FILE UPLOAD INPUT HERE
     html += '<label>Upload Evidence (Screenshot/Photo) - Optional</label>';
     html += '<input type="file" name="evidence" />';
     
@@ -113,7 +122,6 @@ app.post('/analyze', requireLogin, upload.single('evidence'), async function(req
     var incidentId = null;
     var fileUploaded = false;
     
-    // 1. Save to Database
     try {
         var dbResult = await pool.query(
             'INSERT INTO incidents (title, description, severity, verdict, score, reported_by) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
@@ -122,7 +130,6 @@ app.post('/analyze', requireLogin, upload.single('evidence'), async function(req
         incidentId = dbResult.rows[0].id;
     } catch (e) { console.error('DB Error:', e.message); }
 
-    // 2. Upload to S3 (if file attached)
     if (req.file && incidentId) {
         var key = 'incidents/INC-' + incidentId + '/' + Date.now() + '-' + req.file.originalname;
         try {
@@ -140,7 +147,6 @@ app.post('/analyze', requireLogin, upload.single('evidence'), async function(req
         } catch (e) { console.error('S3 Error:', e.message); }
     }
 
-    // 3. Send to SQS
     if (result.score >= 15 && incidentId) {
         try {
             await sqs.send(new SendMessageCommand({
@@ -230,7 +236,6 @@ app.get('/login', function(req, res) {
     res.send(html);
 });
 
-// ================= LOGIN (REDIRECTS TO DASHBOARD NOW) =================
 app.post('/login', async function(req, res) {
     var email = req.body.email;
     var password = req.body.password;
@@ -251,7 +256,7 @@ app.post('/login', async function(req, res) {
             role: role || 'Employee',
             accessToken: result.AuthenticationResult.AccessToken
         };
-        res.redirect('/dashboard'); // CHANGED: Redirects to dashboard
+        res.redirect('/dashboard');
     } catch (e) {
         res.redirect('/login?error=' + encodeURIComponent(e.message));
     }
@@ -327,16 +332,21 @@ app.get('/incidents', requireLogin, async function(req, res) {
     res.send(html);
 });
 
-// ================= INCIDENT DETAIL (SEPARATED ADMIN & ANALYST ACTIONS) =================
+// ================= INCIDENT DETAIL (WITH HISTORY TIMELINE) =================
 app.get('/incident/:id', requireLogin, async function(req, res) {
     var id = req.params.id;
     var incident = null;
     var files = [];
+    var history = [];
     try {
         var r = await pool.query('SELECT * FROM incidents WHERE id = $1', [id]);
         if (r.rows.length > 0) incident = r.rows[0];
+        
         var f = await pool.query('SELECT * FROM evidence WHERE incident_id = $1', [id]);
         files = f.rows;
+
+        var h = await pool.query('SELECT * FROM incident_history WHERE incident_id = $1 ORDER BY timestamp DESC', [id]);
+        history = h.rows;
     } catch (e) { console.error(e.message); }
 
     if (!incident) return res.redirect('/incidents');
@@ -348,14 +358,13 @@ app.get('/incident/:id', requireLogin, async function(req, res) {
     html += '<div class="alert alert-info"><strong>Verdict:</strong> ' + incident.verdict + ' (' + incident.score + '%)</div>';
     
     html += '<div class="stat-grid">';
-    html += '<div class="stat"><div class="lbl">Status</div><div class="num" style="font-size:20px; color:#f59e0b;">' + (incident.status || 'Open') + '</div></div>';
+    html += '<div class="stat"><div class="lbl">Current Status</div><div class="num" style="font-size:20px; color:#f59e0b;">' + (incident.status || 'Open') + '</div></div>';
     html += '<div class="stat"><div class="lbl">Assigned To</div><div class="num" style="font-size:20px; color:#38bdf8;">' + (incident.assigned_to || 'Unassigned') + '</div></div>';
     html += '</div>';
 
     html += '<h2>Message</h2><div class="alert alert-info" style="word-wrap:break-word;">' + incident.description + '</div>';
     html += '<h2>Reported By</h2><p>' + (incident.reported_by || 'anonymous') + '</p>';
 
-    // --- SEPARATED ACTIONS FOR ADMIN VS ANALYST ---
     if (req.session.user.role === 'Admin') {
         html += '<div class="card" style="background:#0f172a; border-color:#38bdf8; margin-top:20px;">';
         html += '<h2>Admin Controls</h2>';
@@ -375,7 +384,22 @@ app.get('/incident/:id', requireLogin, async function(req, res) {
         html += '<button type="submit" class="btn">Update Status</button></form></div>';
     }
 
-    // --- FILE UPLOAD (AVAILABLE TO ALL) ---
+    // --- HISTORY TIMELINE ---
+    html += '<h2 style="margin-top:30px;">Incident History</h2>';
+    if (history.length === 0) {
+        html += '<p>No history recorded yet.</p>';
+    } else {
+        html += '<div style="border-left: 2px solid #38bdf8; padding-left: 15px; margin-left: 10px;">';
+        history.forEach(function(h) {
+            html += '<div style="margin-bottom: 15px;">';
+            html += '<p style="margin: 0; color: #38bdf8; font-size: 12px;">' + new Date(h.timestamp).toLocaleString() + '</p>';
+            html += '<p style="margin: 0; font-weight: bold; color: #fff;">' + h.action + '</p>';
+            html += '<p style="margin: 0; color: #94a3b8; font-size: 13px;">By: ' + h.performed_by + '</p>';
+            html += '</div>';
+        });
+        html += '</div>';
+    }
+
     html += '<h2 style="margin-top:25px;">Upload Additional Evidence</h2>';
     html += '<form method="POST" action="/incident/' + id + '/upload" enctype="multipart/form-data">';
     html += '<input type="file" name="evidence" required />';
@@ -393,19 +417,28 @@ app.get('/incident/:id', requireLogin, async function(req, res) {
     res.send(html);
 });
 
-// ================= COMBINED UPDATE ROUTE =================
+// ================= UPDATE ROUTE (LOGS HISTORY) =================
 app.post('/incident/:id/update', requireLogin, async function(req, res) {
     var id = req.params.id;
-    var status = req.body.status;
+    var newStatus = req.body.status;
     var assigned_to = req.body.assigned_to || null; 
     
     try {
+        var current = await pool.query('SELECT status, assigned_to FROM incidents WHERE id = $1', [id]);
+        var oldStatus = current.rows[0].status;
+        var oldAssignee = current.rows[0].assigned_to;
+
         if (req.session.user.role === 'Admin') {
-            // Admins can assign AND change status
-            await pool.query('UPDATE incidents SET status = $1, assigned_to = $2 WHERE id = $3', [status, assigned_to, id]);
+            await pool.query('UPDATE incidents SET status = $1, assigned_to = $2 WHERE id = $3', [newStatus, assigned_to, id]);
+            if (oldAssignee !== assigned_to) {
+                await pool.query('INSERT INTO incident_history (incident_id, action, performed_by) VALUES ($1, $2, $3)', [id, 'Assigned to: ' + (assigned_to || 'Unassigned'), req.session.user.email]);
+            }
         } else {
-            // Analysts can only change status
-            await pool.query('UPDATE incidents SET status = $1 WHERE id = $2', [status, id]);
+            await pool.query('UPDATE incidents SET status = $1 WHERE id = $2', [newStatus, id]);
+        }
+
+        if (oldStatus !== newStatus) {
+            await pool.query('INSERT INTO incident_history (incident_id, action, performed_by) VALUES ($1, $2, $3)', [id, 'Status changed from ' + oldStatus + ' to ' + newStatus, req.session.user.email]);
         }
     } catch (e) { console.error(e.message); }
     res.redirect('/incident/' + id);
@@ -430,7 +463,6 @@ app.post('/incident/:id/upload', requireLogin, upload.single('evidence'), async 
     res.redirect('/incident/' + id);
 });
 
-// ================= ADMIN PANEL (SHOWS ASSIGNMENT) =================
 app.get('/admin', requireLogin, async function(req, res) {
     if (req.session.user.role !== 'Admin') return res.redirect('/dashboard');
     var rows = [];
