@@ -39,7 +39,6 @@ const pool = new Pool({
     max: 10
 });
 
-// AUTOMATICALLY CREATE HISTORY TABLE ON STARTUP
 pool.query(`
     CREATE TABLE IF NOT EXISTS incident_history (
         id SERIAL PRIMARY KEY,
@@ -92,7 +91,6 @@ function analyzeMessage(msg) {
     return { score: score, verdict: verdict, matched: matched };
 }
 
-// ================= HOME: REPORT FORM (WITH FILE UPLOAD) =================
 app.get('/', requireLogin, function(req, res) {
     var html = '<!DOCTYPE html><html><head><title>SecureShield</title>' + styles + '</head><body>';
     html += nav(req.session.user);
@@ -100,14 +98,11 @@ app.get('/', requireLogin, function(req, res) {
     html += '<h1>Cybersecurity Incident Platform</h1>';
     html += '<p style="text-align:center;">AI-Powered Phishing Detection</p>';
     html += '<div class="card"><h2>Report Suspicious Message</h2>';
-    
     html += '<form method="POST" action="/analyze" enctype="multipart/form-data">';
     html += '<label>Paste the suspicious message</label>';
     html += '<textarea name="message" rows="6" required>Urgent! Your bank account has been compromised. Click this link to reset your password immediately.</textarea>';
-    
     html += '<label>Upload Evidence (Screenshot/Photo) - Optional</label>';
     html += '<input type="file" name="evidence" />';
-    
     html += '<button type="submit" class="btn">Analyze Threat Level</button>';
     html += '</form></div>';
     html += '<div class="footer">Powered by AWS ECS Fargate | ALB | Cognito | RDS | S3 | SQS | Lambda | CloudWatch</div>';
@@ -115,7 +110,6 @@ app.get('/', requireLogin, function(req, res) {
     res.send(html);
 });
 
-// ================= ANALYZE (HANDLES FILE UPLOAD TO S3) =================
 app.post('/analyze', requireLogin, upload.single('evidence'), async function(req, res) {
     var msg = req.body.message || '';
     var result = analyzeMessage(msg);
@@ -183,7 +177,7 @@ app.post('/analyze', requireLogin, upload.single('evidence'), async function(req
     html += '<h2 style="margin-top:25px;">Analyzed Message</h2>';
     html += '<div class="alert alert-info" style="word-wrap:break-word;">' + msg + '</div>';
     html += '<a href="/" class="btn btn-secondary" style="margin-top:15px;">Analyze Another</a>';
-    html += '<a href="/incidents" class="btn" style="margin-top:10px;">View All Incidents</a>';
+    html += '<a href="/dashboard" class="btn" style="margin-top:10px;">Go to Dashboard</a>';
     html += '</div></div></body></html>';
     res.send(html);
 });
@@ -267,16 +261,32 @@ app.get('/logout', function(req, res) {
     res.redirect('/login');
 });
 
-// ================= ROLE-BASED DASHBOARD =================
+// ================= ROLE-BASED DASHBOARD (UPDATED FOR EMPLOYEE VISIBILITY) =================
 app.get('/dashboard', requireLogin, async function(req, res) {
     var stats = { total: 0, phishing: 0, safe: 0 };
+    var myIncidents = [];
+    
     try {
-        var r = await pool.query('SELECT verdict, COUNT(*) FROM incidents GROUP BY verdict');
-        r.rows.forEach(function(row) {
-            stats.total += parseInt(row.count);
-            if (row.verdict === 'PHISHING DETECTED') stats.phishing = parseInt(row.count);
-            if (row.verdict === 'SAFE') stats.safe = parseInt(row.count);
-        });
+        if (req.session.user.role === 'Employee') {
+            // Employee sees stats for THEIR incidents only
+            var r = await pool.query('SELECT verdict, COUNT(*) FROM incidents WHERE reported_by = $1 GROUP BY verdict', [req.session.user.email]);
+            r.rows.forEach(function(row) {
+                stats.total += parseInt(row.count);
+                if (row.verdict === 'PHISHING DETECTED') stats.phishing = parseInt(row.count);
+                if (row.verdict === 'SAFE') stats.safe = parseInt(row.count);
+            });
+            // Employee sees a list of THEIR recent incidents
+            var i = await pool.query('SELECT id, title, verdict, status FROM incidents WHERE reported_by = $1 ORDER BY created_at DESC LIMIT 5', [req.session.user.email]);
+            myIncidents = i.rows;
+        } else {
+            // Admin and Analyst see global stats
+            var r = await pool.query('SELECT verdict, COUNT(*) FROM incidents GROUP BY verdict');
+            r.rows.forEach(function(row) {
+                stats.total += parseInt(row.count);
+                if (row.verdict === 'PHISHING DETECTED') stats.phishing = parseInt(row.count);
+                if (row.verdict === 'SAFE') stats.safe = parseInt(row.count);
+            });
+        }
     } catch (e) { console.error(e.message); }
 
     var html = '<!DOCTYPE html><html><head><title>Dashboard</title>' + styles + '</head><body>';
@@ -289,6 +299,18 @@ app.get('/dashboard', requireLogin, async function(req, res) {
         html += '<div class="card"><h2>Employee Portal</h2>';
         html += '<p>As an Employee, your role is to report suspicious messages to the security team.</p>';
         html += '<a href="/" class="btn">Report New Incident</a></div>';
+        
+        // NEW: SHOW EMPLOYEE THEIR TICKET STATUS
+        if (myIncidents.length > 0) {
+            html += '<div class="card"><h2>My Recent Reports</h2>';
+            html += '<table><thead><tr><th>ID</th><th>Title</th><th>Verdict</th><th>Status</th></tr></thead><tbody>';
+            myIncidents.forEach(function(i) {
+                var badge = i.verdict === 'PHISHING DETECTED' ? 'badge-red' : (i.verdict === 'SUSPICIOUS' ? 'badge-orange' : 'badge-green');
+                var statusColor = i.status === 'Resolved' ? '#22c55e' : (i.status === 'Investigating' ? '#f59e0b' : '#ef4444');
+                html += '<tr><td>INC-' + i.id + '</td><td>' + (i.title || '').substring(0, 30) + '</td><td><span class="badge ' + badge + '">' + i.verdict + '</span></td><td style="color:' + statusColor + '; font-weight:bold;">' + i.status + '</td></tr>';
+            });
+            html += '</tbody></table></div>';
+        }
         
     } else if (req.session.user.role === 'Analyst') {
         html += '<div class="card"><h2>Analyst Queue</h2>';
@@ -312,16 +334,24 @@ app.get('/dashboard', requireLogin, async function(req, res) {
     res.send(html);
 });
 
+// ================= INCIDENTS LIST (FILTERED FOR EMPLOYEES) =================
 app.get('/incidents', requireLogin, async function(req, res) {
     var rows = [];
     try {
-        var r = await pool.query('SELECT * FROM incidents ORDER BY created_at DESC LIMIT 50');
-        rows = r.rows;
+        if (req.session.user.role === 'Employee') {
+            // Employee only sees their own incidents
+            var r = await pool.query('SELECT * FROM incidents WHERE reported_by = $1 ORDER BY created_at DESC', [req.session.user.email]);
+            rows = r.rows;
+        } else {
+            // Admin and Analyst see all incidents
+            var r = await pool.query('SELECT * FROM incidents ORDER BY created_at DESC LIMIT 50');
+            rows = r.rows;
+        }
     } catch (e) { console.error(e.message); }
 
     var html = '<!DOCTYPE html><html><head><title>Incidents</title>' + styles + '</head><body>';
     html += nav(req.session.user);
-    html += '<div class="main"><div class="card"><h1>All Incidents</h1>';
+    html += '<div class="main"><div class="card"><h1>Incidents</h1>';
     html += '<table><thead><tr><th>ID</th><th>Title</th><th>Verdict</th><th>Score</th><th>Status</th><th>Action</th></tr></thead><tbody>';
     rows.forEach(function(r) {
         var badge = r.verdict === 'PHISHING DETECTED' ? 'badge-red' : (r.verdict === 'SUSPICIOUS' ? 'badge-orange' : 'badge-green');
@@ -342,6 +372,11 @@ app.get('/incident/:id', requireLogin, async function(req, res) {
         var r = await pool.query('SELECT * FROM incidents WHERE id = $1', [id]);
         if (r.rows.length > 0) incident = r.rows[0];
         
+        // SECURITY CHECK: Employee can only view their own incident
+        if (req.session.user.role === 'Employee' && incident.reported_by !== req.session.user.email) {
+            return res.redirect('/incidents');
+        }
+
         var f = await pool.query('SELECT * FROM evidence WHERE incident_id = $1', [id]);
         files = f.rows;
 
@@ -417,7 +452,6 @@ app.get('/incident/:id', requireLogin, async function(req, res) {
     res.send(html);
 });
 
-// ================= UPDATE ROUTE (LOGS HISTORY) =================
 app.post('/incident/:id/update', requireLogin, async function(req, res) {
     var id = req.params.id;
     var newStatus = req.body.status;
