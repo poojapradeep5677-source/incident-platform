@@ -39,6 +39,7 @@ const pool = new Pool({
     max: 10
 });
 
+// AUTOMATICALLY CREATE/UPDATE TABLES ON STARTUP
 pool.query(`
     CREATE TABLE IF NOT EXISTS incident_history (
         id SERIAL PRIMARY KEY,
@@ -46,8 +47,9 @@ pool.query(`
         action VARCHAR(255),
         performed_by VARCHAR(255),
         timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-`).catch(err => console.error("History table creation error:", err));
+    );
+    ALTER TABLE incidents ADD COLUMN IF NOT EXISTS resolution_notes TEXT;
+`).catch(err => console.error("Table creation error:", err));
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 
@@ -166,13 +168,11 @@ app.post('/analyze', requireLogin, upload.single('evidence'), async function(req
     html += '<h1 style="color:' + color + ';font-size:60px;">' + result.score + '%</h1>';
     html += '<h2 style="text-align:center;color:' + color + ';letter-spacing:2px;">' + result.verdict + '</h2>';
     html += '<div class="alert alert-info"><strong>Recommended Action:</strong> ' + advice + '</div>';
-    
     if (incidentId) {
         html += '<div class="alert alert-success">Incident saved as ID: INC-' + incidentId;
         if (fileUploaded) html += ' | Evidence uploaded to S3';
         html += ' | Sent to SQS queue.</div>';
     }
-    
     html += '<h2>Detected Threat Indicators</h2><div>' + keywordHtml + '</div>';
     html += '<h2 style="margin-top:25px;">Analyzed Message</h2>';
     html += '<div class="alert alert-info" style="word-wrap:break-word;">' + msg + '</div>';
@@ -261,25 +261,22 @@ app.get('/logout', function(req, res) {
     res.redirect('/login');
 });
 
-// ================= ROLE-BASED DASHBOARD (UPDATED FOR EMPLOYEE VISIBILITY) =================
+// ================= ROLE-BASED DASHBOARD (WITH RESOLUTION NOTES VISIBLE) =================
 app.get('/dashboard', requireLogin, async function(req, res) {
     var stats = { total: 0, phishing: 0, safe: 0 };
     var myIncidents = [];
     
     try {
         if (req.session.user.role === 'Employee') {
-            // Employee sees stats for THEIR incidents only
             var r = await pool.query('SELECT verdict, COUNT(*) FROM incidents WHERE reported_by = $1 GROUP BY verdict', [req.session.user.email]);
             r.rows.forEach(function(row) {
                 stats.total += parseInt(row.count);
                 if (row.verdict === 'PHISHING DETECTED') stats.phishing = parseInt(row.count);
                 if (row.verdict === 'SAFE') stats.safe = parseInt(row.count);
             });
-            // Employee sees a list of THEIR recent incidents
-            var i = await pool.query('SELECT id, title, verdict, status FROM incidents WHERE reported_by = $1 ORDER BY created_at DESC LIMIT 5', [req.session.user.email]);
+            var i = await pool.query('SELECT * FROM incidents WHERE reported_by = $1 ORDER BY created_at DESC LIMIT 5', [req.session.user.email]);
             myIncidents = i.rows;
         } else {
-            // Admin and Analyst see global stats
             var r = await pool.query('SELECT verdict, COUNT(*) FROM incidents GROUP BY verdict');
             r.rows.forEach(function(row) {
                 stats.total += parseInt(row.count);
@@ -300,14 +297,13 @@ app.get('/dashboard', requireLogin, async function(req, res) {
         html += '<p>As an Employee, your role is to report suspicious messages to the security team.</p>';
         html += '<a href="/" class="btn">Report New Incident</a></div>';
         
-        // NEW: SHOW EMPLOYEE THEIR TICKET STATUS
         if (myIncidents.length > 0) {
             html += '<div class="card"><h2>My Recent Reports</h2>';
-            html += '<table><thead><tr><th>ID</th><th>Title</th><th>Verdict</th><th>Status</th></tr></thead><tbody>';
+            html += '<table><thead><tr><th>ID</th><th>Title</th><th>Status</th><th>Resolution / Update</th></tr></thead><tbody>';
             myIncidents.forEach(function(i) {
-                var badge = i.verdict === 'PHISHING DETECTED' ? 'badge-red' : (i.verdict === 'SUSPICIOUS' ? 'badge-orange' : 'badge-green');
                 var statusColor = i.status === 'Resolved' ? '#22c55e' : (i.status === 'Investigating' ? '#f59e0b' : '#ef4444');
-                html += '<tr><td>INC-' + i.id + '</td><td>' + (i.title || '').substring(0, 30) + '</td><td><span class="badge ' + badge + '">' + i.verdict + '</span></td><td style="color:' + statusColor + '; font-weight:bold;">' + i.status + '</td></tr>';
+                var notes = i.resolution_notes ? i.resolution_notes : '<span style="color:#64748b;">No update yet</span>';
+                html += '<tr><td>INC-' + i.id + '</td><td>' + (i.title || '').substring(0, 30) + '</td><td style="color:' + statusColor + '; font-weight:bold;">' + i.status + '</td><td>' + notes + '</td></tr>';
             });
             html += '</tbody></table></div>';
         }
@@ -334,16 +330,13 @@ app.get('/dashboard', requireLogin, async function(req, res) {
     res.send(html);
 });
 
-// ================= INCIDENTS LIST (FILTERED FOR EMPLOYEES) =================
 app.get('/incidents', requireLogin, async function(req, res) {
     var rows = [];
     try {
         if (req.session.user.role === 'Employee') {
-            // Employee only sees their own incidents
             var r = await pool.query('SELECT * FROM incidents WHERE reported_by = $1 ORDER BY created_at DESC', [req.session.user.email]);
             rows = r.rows;
         } else {
-            // Admin and Analyst see all incidents
             var r = await pool.query('SELECT * FROM incidents ORDER BY created_at DESC LIMIT 50');
             rows = r.rows;
         }
@@ -362,7 +355,7 @@ app.get('/incidents', requireLogin, async function(req, res) {
     res.send(html);
 });
 
-// ================= INCIDENT DETAIL (WITH HISTORY TIMELINE) =================
+// ================= INCIDENT DETAIL (WITH RESOLUTION NOTES) =================
 app.get('/incident/:id', requireLogin, async function(req, res) {
     var id = req.params.id;
     var incident = null;
@@ -372,7 +365,6 @@ app.get('/incident/:id', requireLogin, async function(req, res) {
         var r = await pool.query('SELECT * FROM incidents WHERE id = $1', [id]);
         if (r.rows.length > 0) incident = r.rows[0];
         
-        // SECURITY CHECK: Employee can only view their own incident
         if (req.session.user.role === 'Employee' && incident.reported_by !== req.session.user.email) {
             return res.redirect('/incidents');
         }
@@ -397,6 +389,11 @@ app.get('/incident/:id', requireLogin, async function(req, res) {
     html += '<div class="stat"><div class="lbl">Assigned To</div><div class="num" style="font-size:20px; color:#38bdf8;">' + (incident.assigned_to || 'Unassigned') + '</div></div>';
     html += '</div>';
 
+    // SHOW RESOLUTION NOTES TO EVERYONE IF THEY EXIST
+    if (incident.resolution_notes) {
+        html += '<div class="alert alert-success"><strong>Resolution Notes:</strong><br/>' + incident.resolution_notes + '</div>';
+    }
+
     html += '<h2>Message</h2><div class="alert alert-info" style="word-wrap:break-word;">' + incident.description + '</div>';
     html += '<h2>Reported By</h2><p>' + (incident.reported_by || 'anonymous') + '</p>';
 
@@ -406,6 +403,8 @@ app.get('/incident/:id', requireLogin, async function(req, res) {
         html += '<form method="POST" action="/incident/' + id + '/update">';
         html += '<label>Assign to Analyst (Email)</label>';
         html += '<input type="email" name="assigned_to" value="' + (incident.assigned_to || '') + '" placeholder="analyst@demo.com" />';
+        html += '<label>Resolution Notes (Explain how this was fixed)</label>';
+        html += '<textarea name="resolution_notes" rows="3" placeholder="e.g., Blocked sender domain and deleted email from all inboxes.">' + (incident.resolution_notes || '') + '</textarea>';
         html += '<label>Update Status</label>';
         html += '<select name="status"><option ' + (incident.status === 'Open' ? 'selected' : '') + '>Open</option><option ' + (incident.status === 'Investigating' ? 'selected' : '') + '>Investigating</option><option ' + (incident.status === 'Resolved' ? 'selected' : '') + '>Resolved</option></select>';
         html += '<button type="submit" class="btn">Save Admin Updates</button></form></div>';
@@ -414,12 +413,13 @@ app.get('/incident/:id', requireLogin, async function(req, res) {
         html += '<div class="card" style="background:#0f172a; margin-top:20px;">';
         html += '<h2>Investigator Actions</h2>';
         html += '<form method="POST" action="/incident/' + id + '/update">';
+        html += '<label>Resolution Notes (Explain how this was fixed)</label>';
+        html += '<textarea name="resolution_notes" rows="3" placeholder="e.g., Blocked sender domain and deleted email from all inboxes.">' + (incident.resolution_notes || '') + '</textarea>';
         html += '<label>Update Status</label>';
         html += '<select name="status"><option ' + (incident.status === 'Open' ? 'selected' : '') + '>Open</option><option ' + (incident.status === 'Investigating' ? 'selected' : '') + '>Investigating</option><option ' + (incident.status === 'Resolved' ? 'selected' : '') + '>Resolved</option></select>';
-        html += '<button type="submit" class="btn">Update Status</button></form></div>';
+        html += '<button type="submit" class="btn">Update Status & Notes</button></form></div>';
     }
 
-    // --- HISTORY TIMELINE ---
     html += '<h2 style="margin-top:30px;">Incident History</h2>';
     if (history.length === 0) {
         html += '<p>No history recorded yet.</p>';
@@ -452,10 +452,12 @@ app.get('/incident/:id', requireLogin, async function(req, res) {
     res.send(html);
 });
 
+// ================= UPDATE ROUTE (SAVES RESOLUTION NOTES & HISTORY) =================
 app.post('/incident/:id/update', requireLogin, async function(req, res) {
     var id = req.params.id;
     var newStatus = req.body.status;
     var assigned_to = req.body.assigned_to || null; 
+    var resolution_notes = req.body.resolution_notes || null;
     
     try {
         var current = await pool.query('SELECT status, assigned_to FROM incidents WHERE id = $1', [id]);
@@ -463,12 +465,12 @@ app.post('/incident/:id/update', requireLogin, async function(req, res) {
         var oldAssignee = current.rows[0].assigned_to;
 
         if (req.session.user.role === 'Admin') {
-            await pool.query('UPDATE incidents SET status = $1, assigned_to = $2 WHERE id = $3', [newStatus, assigned_to, id]);
+            await pool.query('UPDATE incidents SET status = $1, assigned_to = $2, resolution_notes = $3 WHERE id = $4', [newStatus, assigned_to, resolution_notes, id]);
             if (oldAssignee !== assigned_to) {
                 await pool.query('INSERT INTO incident_history (incident_id, action, performed_by) VALUES ($1, $2, $3)', [id, 'Assigned to: ' + (assigned_to || 'Unassigned'), req.session.user.email]);
             }
         } else {
-            await pool.query('UPDATE incidents SET status = $1 WHERE id = $2', [newStatus, id]);
+            await pool.query('UPDATE incidents SET status = $1, resolution_notes = $2 WHERE id = $3', [newStatus, resolution_notes, id]);
         }
 
         if (oldStatus !== newStatus) {
