@@ -81,6 +81,7 @@ function analyzeMessage(msg) {
     return { score: score, verdict: verdict, matched: matched };
 }
 
+// ================= HOME: REPORT FORM (WITH FILE UPLOAD) =================
 app.get('/', requireLogin, function(req, res) {
     var html = '<!DOCTYPE html><html><head><title>SecureShield</title>' + styles + '</head><body>';
     html += nav(req.session.user);
@@ -88,9 +89,16 @@ app.get('/', requireLogin, function(req, res) {
     html += '<h1>Cybersecurity Incident Platform</h1>';
     html += '<p style="text-align:center;">AI-Powered Phishing Detection</p>';
     html += '<div class="card"><h2>Report Suspicious Message</h2>';
-    html += '<form method="POST" action="/analyze">';
+    
+    // ADDED enctype="multipart/form-data" for file uploads
+    html += '<form method="POST" action="/analyze" enctype="multipart/form-data">';
     html += '<label>Paste the suspicious message</label>';
     html += '<textarea name="message" rows="6" required>Urgent! Your bank account has been compromised. Click this link to reset your password immediately.</textarea>';
+    
+    // ADDED FILE UPLOAD INPUT HERE
+    html += '<label>Upload Evidence (Screenshot/Photo) - Optional</label>';
+    html += '<input type="file" name="evidence" />';
+    
     html += '<button type="submit" class="btn">Analyze Threat Level</button>';
     html += '</form></div>';
     html += '<div class="footer">Powered by AWS ECS Fargate | ALB | Cognito | RDS | S3 | SQS | Lambda | CloudWatch</div>';
@@ -98,10 +106,14 @@ app.get('/', requireLogin, function(req, res) {
     res.send(html);
 });
 
-app.post('/analyze', requireLogin, async function(req, res) {
+// ================= ANALYZE (HANDLES FILE UPLOAD TO S3) =================
+app.post('/analyze', requireLogin, upload.single('evidence'), async function(req, res) {
     var msg = req.body.message || '';
     var result = analyzeMessage(msg);
     var incidentId = null;
+    var fileUploaded = false;
+    
+    // 1. Save to Database
     try {
         var dbResult = await pool.query(
             'INSERT INTO incidents (title, description, severity, verdict, score, reported_by) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
@@ -110,6 +122,25 @@ app.post('/analyze', requireLogin, async function(req, res) {
         incidentId = dbResult.rows[0].id;
     } catch (e) { console.error('DB Error:', e.message); }
 
+    // 2. Upload to S3 (if file attached)
+    if (req.file && incidentId) {
+        var key = 'incidents/INC-' + incidentId + '/' + Date.now() + '-' + req.file.originalname;
+        try {
+            await s3.send(new PutObjectCommand({
+                Bucket: BUCKET,
+                Key: key,
+                Body: req.file.buffer,
+                ContentType: req.file.mimetype
+            }));
+            await pool.query(
+                'INSERT INTO evidence (incident_id, file_name, s3_key, uploaded_by) VALUES ($1, $2, $3, $4)',
+                [incidentId, req.file.originalname, key, req.session.user.email]
+            );
+            fileUploaded = true;
+        } catch (e) { console.error('S3 Error:', e.message); }
+    }
+
+    // 3. Send to SQS
     if (result.score >= 15 && incidentId) {
         try {
             await sqs.send(new SendMessageCommand({
@@ -135,7 +166,13 @@ app.post('/analyze', requireLogin, async function(req, res) {
     html += '<h1 style="color:' + color + ';font-size:60px;">' + result.score + '%</h1>';
     html += '<h2 style="text-align:center;color:' + color + ';letter-spacing:2px;">' + result.verdict + '</h2>';
     html += '<div class="alert alert-info"><strong>Recommended Action:</strong> ' + advice + '</div>';
-    if (incidentId) html += '<div class="alert alert-success">Incident saved to database as ID: INC-' + incidentId + ' - Message sent to SQS queue.</div>';
+    
+    if (incidentId) {
+        html += '<div class="alert alert-success">Incident saved as ID: INC-' + incidentId;
+        if (fileUploaded) html += ' | Evidence uploaded to S3';
+        html += ' | Sent to SQS queue.</div>';
+    }
+    
     html += '<h2>Detected Threat Indicators</h2><div>' + keywordHtml + '</div>';
     html += '<h2 style="margin-top:25px;">Analyzed Message</h2>';
     html += '<div class="alert alert-info" style="word-wrap:break-word;">' + msg + '</div>';
@@ -193,6 +230,7 @@ app.get('/login', function(req, res) {
     res.send(html);
 });
 
+// ================= LOGIN (REDIRECTS TO DASHBOARD NOW) =================
 app.post('/login', async function(req, res) {
     var email = req.body.email;
     var password = req.body.password;
@@ -213,7 +251,7 @@ app.post('/login', async function(req, res) {
             role: role || 'Employee',
             accessToken: result.AuthenticationResult.AccessToken
         };
-        res.redirect('/');
+        res.redirect('/dashboard'); // CHANGED: Redirects to dashboard
     } catch (e) {
         res.redirect('/login?error=' + encodeURIComponent(e.message));
     }
@@ -242,7 +280,6 @@ app.get('/dashboard', requireLogin, async function(req, res) {
     html += '<h1>Welcome, ' + req.session.user.name + '</h1>';
     html += '<p style="text-align:center;">Logged in as: <span class="badge badge-blue">' + req.session.user.role + '</span></p>';
 
-    // DIFFERENT VIEWS BASED ON ROLE
     if (req.session.user.role === 'Employee') {
         html += '<div class="card"><h2>Employee Portal</h2>';
         html += '<p>As an Employee, your role is to report suspicious messages to the security team.</p>';
@@ -255,12 +292,11 @@ app.get('/dashboard', requireLogin, async function(req, res) {
 
     } else if (req.session.user.role === 'Admin') {
         html += '<div class="card"><h2>Admin Command Center</h2>';
-        html += '<p>As an Admin, you have full visibility into the security posture and can manage all incidents.</p>';
+        html += '<p>As an Admin, you have full visibility into the security posture and can assign incidents to analysts.</p>';
         html += '<a href="/incidents" class="btn">View All Incidents</a>';
-        html += '<a href="/admin" class="btn btn-secondary">Admin Settings</a></div>';
+        html += '<a href="/admin" class="btn btn-secondary">Admin Panel</a></div>';
     }
 
-    // Show the stats to everyone
     html += '<div class="stat-grid">';
     html += '<div class="stat"><div class="num">' + stats.total + '</div><div class="lbl">Total Incidents</div></div>';
     html += '<div class="stat"><div class="num" style="color:#ef4444;">' + stats.phishing + '</div><div class="lbl">Phishing Detected</div></div>';
@@ -281,16 +317,17 @@ app.get('/incidents', requireLogin, async function(req, res) {
     var html = '<!DOCTYPE html><html><head><title>Incidents</title>' + styles + '</head><body>';
     html += nav(req.session.user);
     html += '<div class="main"><div class="card"><h1>All Incidents</h1>';
-    html += '<table><thead><tr><th>ID</th><th>Title</th><th>Verdict</th><th>Score</th><th>Reported By</th><th>Status</th><th>Action</th></tr></thead><tbody>';
+    html += '<table><thead><tr><th>ID</th><th>Title</th><th>Verdict</th><th>Score</th><th>Status</th><th>Action</th></tr></thead><tbody>';
     rows.forEach(function(r) {
         var badge = r.verdict === 'PHISHING DETECTED' ? 'badge-red' : (r.verdict === 'SUSPICIOUS' ? 'badge-orange' : 'badge-green');
-        html += '<tr><td>INC-' + r.id + '</td><td>' + (r.title || '').substring(0, 40) + '</td><td><span class="badge ' + badge + '">' + r.verdict + '</span></td><td>' + r.score + '%</td><td>' + (r.reported_by || 'anonymous') + '</td><td>' + r.status + '</td><td><a href="/incident/' + r.id + '" style="color:#38bdf8;">View</a></td></tr>';
+        html += '<tr><td>INC-' + r.id + '</td><td>' + (r.title || '').substring(0, 40) + '</td><td><span class="badge ' + badge + '">' + r.verdict + '</span></td><td>' + r.score + '%</td><td>' + r.status + '</td><td><a href="/incident/' + r.id + '" style="color:#38bdf8;">View</a></td></tr>';
     });
-    if (rows.length === 0) html += '<tr><td colspan="7" style="text-align:center;">No incidents reported yet.</td></tr>';
+    if (rows.length === 0) html += '<tr><td colspan="6" style="text-align:center;">No incidents reported yet.</td></tr>';
     html += '</tbody></table></div></div></body></html>';
     res.send(html);
 });
 
+// ================= INCIDENT DETAIL (SEPARATED ADMIN & ANALYST ACTIONS) =================
 app.get('/incident/:id', requireLogin, async function(req, res) {
     var id = req.params.id;
     var incident = null;
@@ -309,17 +346,37 @@ app.get('/incident/:id', requireLogin, async function(req, res) {
     html += '<div class="main"><div class="card">';
     html += '<h1>Incident INC-' + id + '</h1>';
     html += '<div class="alert alert-info"><strong>Verdict:</strong> ' + incident.verdict + ' (' + incident.score + '%)</div>';
+    
+    html += '<div class="stat-grid">';
+    html += '<div class="stat"><div class="lbl">Status</div><div class="num" style="font-size:20px; color:#f59e0b;">' + (incident.status || 'Open') + '</div></div>';
+    html += '<div class="stat"><div class="lbl">Assigned To</div><div class="num" style="font-size:20px; color:#38bdf8;">' + (incident.assigned_to || 'Unassigned') + '</div></div>';
+    html += '</div>';
+
     html += '<h2>Message</h2><div class="alert alert-info" style="word-wrap:break-word;">' + incident.description + '</div>';
     html += '<h2>Reported By</h2><p>' + (incident.reported_by || 'anonymous') + '</p>';
 
-    if (req.session.user.role === 'Analyst' || req.session.user.role === 'Admin') {
-        html += '<h2>Update Status</h2>';
-        html += '<form method="POST" action="/incident/' + id + '/status">';
+    // --- SEPARATED ACTIONS FOR ADMIN VS ANALYST ---
+    if (req.session.user.role === 'Admin') {
+        html += '<div class="card" style="background:#0f172a; border-color:#38bdf8; margin-top:20px;">';
+        html += '<h2>Admin Controls</h2>';
+        html += '<form method="POST" action="/incident/' + id + '/update">';
+        html += '<label>Assign to Analyst (Email)</label>';
+        html += '<input type="email" name="assigned_to" value="' + (incident.assigned_to || '') + '" placeholder="analyst@demo.com" />';
+        html += '<label>Update Status</label>';
         html += '<select name="status"><option ' + (incident.status === 'Open' ? 'selected' : '') + '>Open</option><option ' + (incident.status === 'Investigating' ? 'selected' : '') + '>Investigating</option><option ' + (incident.status === 'Resolved' ? 'selected' : '') + '>Resolved</option></select>';
-        html += '<button type="submit" class="btn">Update Status</button></form>';
+        html += '<button type="submit" class="btn">Save Admin Updates</button></form></div>';
+
+    } else if (req.session.user.role === 'Analyst') {
+        html += '<div class="card" style="background:#0f172a; margin-top:20px;">';
+        html += '<h2>Investigator Actions</h2>';
+        html += '<form method="POST" action="/incident/' + id + '/update">';
+        html += '<label>Update Status</label>';
+        html += '<select name="status"><option ' + (incident.status === 'Open' ? 'selected' : '') + '>Open</option><option ' + (incident.status === 'Investigating' ? 'selected' : '') + '>Investigating</option><option ' + (incident.status === 'Resolved' ? 'selected' : '') + '>Resolved</option></select>';
+        html += '<button type="submit" class="btn">Update Status</button></form></div>';
     }
 
-    html += '<h2 style="margin-top:25px;">Upload Evidence</h2>';
+    // --- FILE UPLOAD (AVAILABLE TO ALL) ---
+    html += '<h2 style="margin-top:25px;">Upload Additional Evidence</h2>';
     html += '<form method="POST" action="/incident/' + id + '/upload" enctype="multipart/form-data">';
     html += '<input type="file" name="evidence" required />';
     html += '<button type="submit" class="btn">Upload to S3</button></form>';
@@ -336,11 +393,22 @@ app.get('/incident/:id', requireLogin, async function(req, res) {
     res.send(html);
 });
 
-app.post('/incident/:id/status', requireLogin, async function(req, res) {
+// ================= COMBINED UPDATE ROUTE =================
+app.post('/incident/:id/update', requireLogin, async function(req, res) {
+    var id = req.params.id;
+    var status = req.body.status;
+    var assigned_to = req.body.assigned_to || null; 
+    
     try {
-        await pool.query('UPDATE incidents SET status = $1 WHERE id = $2', [req.body.status, req.params.id]);
+        if (req.session.user.role === 'Admin') {
+            // Admins can assign AND change status
+            await pool.query('UPDATE incidents SET status = $1, assigned_to = $2 WHERE id = $3', [status, assigned_to, id]);
+        } else {
+            // Analysts can only change status
+            await pool.query('UPDATE incidents SET status = $1 WHERE id = $2', [status, id]);
+        }
     } catch (e) { console.error(e.message); }
-    res.redirect('/incident/' + req.params.id);
+    res.redirect('/incident/' + id);
 });
 
 app.post('/incident/:id/upload', requireLogin, upload.single('evidence'), async function(req, res) {
@@ -362,6 +430,7 @@ app.post('/incident/:id/upload', requireLogin, upload.single('evidence'), async 
     res.redirect('/incident/' + id);
 });
 
+// ================= ADMIN PANEL (SHOWS ASSIGNMENT) =================
 app.get('/admin', requireLogin, async function(req, res) {
     if (req.session.user.role !== 'Admin') return res.redirect('/dashboard');
     var rows = [];
@@ -372,10 +441,10 @@ app.get('/admin', requireLogin, async function(req, res) {
 
     var html = '<!DOCTYPE html><html><head><title>Admin</title>' + styles + '</head><body>';
     html += nav(req.session.user);
-    html += '<div class="main"><div class="card"><h1>Admin Panel</h1>';
-    html += '<table><thead><tr><th>ID</th><th>Verdict</th><th>Status</th><th>Reported By</th><th>Action</th></tr></thead><tbody>';
+    html += '<div class="main"><div class="card"><h1>Admin Management Panel</h1>';
+    html += '<table><thead><tr><th>ID</th><th>Verdict</th><th>Status</th><th>Assigned To</th><th>Action</th></tr></thead><tbody>';
     rows.forEach(function(r) {
-        html += '<tr><td>INC-' + r.id + '</td><td>' + r.verdict + '</td><td>' + r.status + '</td><td>' + (r.reported_by || 'anonymous') + '</td><td><a href="/incident/' + r.id + '" style="color:#38bdf8;">Manage</a></td></tr>';
+        html += '<tr><td>INC-' + r.id + '</td><td>' + r.verdict + '</td><td>' + r.status + '</td><td>' + (r.assigned_to || 'Unassigned') + '</td><td><a href="/incident/' + r.id + '" style="color:#38bdf8;">Manage</a></td></tr>';
     });
     html += '</tbody></table></div></div></body></html>';
     res.send(html);
